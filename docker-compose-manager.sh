@@ -344,7 +344,18 @@ wait_for_reranker_model() {
 # unified-memory device. Latency stays tolerable for a single query but the
 # always-on premise is defeated, so surface the actual backend and the host
 # memory headroom instead of pretending the model is on the GPU.
+ENCODER_CPU_FALLBACK=()
+
+container_service() {
+    case "$1" in
+        dcm-embedding-bge-m3) echo embedding ;;
+        dcm-reranker-bge-v2-m3) echo reranker ;;
+        *) echo "" ;;
+    esac
+}
+
 report_encoder_backends() {
+    ENCODER_CPU_FALLBACK=()
     local container backend failed=0
     for container in "${ENCODER_CONTAINERS[@]}"; do
         docker inspect "$container" >/dev/null 2>&1 || { echo "  $container: absent"; continue; }
@@ -353,7 +364,8 @@ report_encoder_backends() {
             | tail -1 || true)
         case "$backend" in
             *Cuda*) echo "  $container: GPU (${backend})" ;;
-            *Cpu*|*CPU*) echo "  $container: CPU FALLBACK (${backend}) - model is NOT on the GPU" >&2; failed=1 ;;
+            *Cpu*|*CPU*) echo "  $container: CPU FALLBACK (${backend}) - model is NOT on the GPU" >&2
+                       ENCODER_CPU_FALLBACK+=("$container"); failed=1 ;;
             *) echo "  $container: backend unknown (still loading?)" ;;
         esac
     done
@@ -367,7 +379,67 @@ report_encoder_backends() {
     return "$failed"
 }
 
+# Report encoder containers that exist but belong to a different Compose
+# project. That is the pre-isolation state (project "local-claude-code"), where
+# the container_name values block a new-project create with a raw Docker name
+# conflict. Refuse with the surgical remedy instead of letting Docker print a
+# confusing error, and never touch the LLM container here.
+encoders_foreign_project_conflicts() {
+    local container project found=0
+    for container in "${ENCODER_CONTAINERS[@]}"; do
+        project=$(docker inspect "$container" \
+            --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null) || continue
+        if [[ -n "$project" && "$project" != "$ENCODERS_PROJECT" ]]; then
+            echo "  $container is running under Compose project '$project', not '$ENCODERS_PROJECT'." >&2
+            found=1
+        fi
+    done
+    [[ "$found" -eq 0 ]]
+}
+
+cmd_encoders_migrate() {
+    local container
+    if encoders_foreign_project_conflicts; then
+        echo "Nothing to migrate: no encoder container is attached to a foreign Compose project."
+        return 0
+    fi
+    echo "This stops the two encoder services for the duration of the recreate (the LLM is" >&2
+    echo "never a target: only the two names below are removed, by explicit container name)." >&2
+    for container in "${ENCODER_CONTAINERS[@]}"; do
+        docker inspect "$container" >/dev/null 2>&1 &&
+            docker rm -f "$container"
+    done
+    start_encoders
+}
+
+# TEI admits a client batch only if it can take that many inference permits, so
+# a client batch larger than --max-concurrent-requests is a guaranteed
+# 429 "Model is overloaded" no matter how much VRAM is free. That misread cost a
+# wrong "raise max_batch_tokens" fix once, so refuse to start a knowingly
+# unsatisfiable configuration instead of letting it fail at query time.
+encoders_budget_invariants() {
+    local rc=0 pair service batch concurrent
+    for pair in "embedding:${DCM_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-32}:${DCM_EMBEDDING_MAX_CONCURRENT_REQUESTS:-32}" \
+                "reranker:${DCM_RERANKER_MAX_CLIENT_BATCH_SIZE:-64}:${DCM_RERANKER_MAX_CONCURRENT_REQUESTS:-64}"; do
+        IFS=':' read -r service batch concurrent <<<"$pair"
+        if (( concurrent < batch )); then
+            echo "Error: $service --max-concurrent-requests ($concurrent) < --max-client-batch-size ($batch)." >&2
+            echo "       Any request with more than $concurrent inputs is a guaranteed 429." >&2
+            echo "       Set DCM_${service^^}_MAX_CONCURRENT_REQUESTS >= $batch." >&2
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 start_encoders() {
+    encoders_budget_invariants || return 2
+    if ! encoders_foreign_project_conflicts; then
+        echo "Error: refusing to start, because an existing encoder container belongs to a" >&2
+        echo "       foreign Compose project and would collide on container_name." >&2
+        echo "       Run 'dcm encoders migrate' to move the encoder plane onto '$ENCODERS_PROJECT'." >&2
+        return 65
+    fi
     echo "Starting TEI encoders (project: $ENCODERS_PROJECT)..."
     if ! encoders_compose up -d --no-deps embedding reranker; then
         echo "Error: encoder services failed to start; the LLM was left running" >&2
@@ -383,8 +455,56 @@ start_encoders() {
         encoders_compose stop reranker >/dev/null 2>&1 || true
         return 70
     fi
-    report_encoder_backends || true
+    converge_encoder_backends
     echo "Encoders are ready: $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+}
+
+# TEI falls back to CPU when candle cannot create a CUDA context, which on GB10
+# unified memory is a transient memory-pressure failure rather than a permanent
+# one: the very same container config has been observed to land on Cuda on the
+# next attempt. A CPU-served encoder silently defeats the always-on premise and
+# also caps max_batch_requests at 4, so retry the offenders a bounded number of
+# times before reporting. Set DCM_REQUIRE_GPU=1 to make an unresolved fallback
+# fail the start instead of leaving a slow-but-correct service running.
+converge_encoder_backends() {
+    local attempt=0
+    local max_attempts="${DCM_GPU_START_ATTEMPTS:-2}"
+    local -a offenders=()
+    local container service
+    while true; do
+        report_encoder_backends || true
+        [[ "${#ENCODER_CPU_FALLBACK[@]}" -eq 0 ]] && return 0
+        if (( attempt >= max_attempts )); then
+            break
+        fi
+        attempt=$((attempt + 1))
+        offenders=()
+        for container in "${ENCODER_CPU_FALLBACK[@]}"; do
+            service=$(container_service "$container")
+            [[ -n "$service" ]] && offenders+=("$service")
+        done
+        if [[ "${#offenders[@]}" -eq 0 ]]; then
+            return 0
+        fi
+        echo "Backend fell back to CPU (unified-memory pressure at CUDA init);" >&2
+        echo "recreating ${offenders[*]} on GPU (attempt ${attempt}/${max_attempts})..." >&2
+        encoders_compose up -d --force-recreate "${offenders[@]}" >/dev/null || true
+        for service in "${offenders[@]}"; do
+            case "$service" in
+                embedding) wait_for_embedding_model "$MODEL_READY_TIMEOUT" || true ;;
+                reranker) wait_for_reranker_model "$MODEL_READY_TIMEOUT" || true ;;
+            esac
+        done
+    done
+    report_encoder_backends || true
+    if [[ "${DCM_REQUIRE_GPU:-0}" == 1 && "${#ENCODER_CPU_FALLBACK[@]}" -gt 0 ]]; then
+        echo "Error: DCM_REQUIRE_GPU=1 and these encoders are CPU-served: ${ENCODER_CPU_FALLBACK[*]}" >&2
+        echo "       Free host memory or lower the batch token budgets, then retry." >&2
+        return 70
+    fi
+    echo "Warning: the encoders above are CPU-served; rerun 'dcm encoders restart' when" >&2
+    echo "         host memory has more headroom." >&2
+    return 0
 }
 
 stop_encoders() {
@@ -490,6 +610,7 @@ Usage:
   dcm encoders up        Start embedding + reranker (contract-validated, no LLM touched)
   dcm encoders down      Stop them (Compose project $ENCODERS_PROJECT only)
   dcm encoders restart   Recreate them
+  dcm encoders migrate   Move pre-isolation encoders onto project $ENCODERS_PROJECT
   dcm encoders status    ps + CUDA/CPU backend + MemAvailable headroom
   dcm encoders logs      docker compose logs for both encoders
   dcm encoders validate  Probe the live /info, /v1/embeddings and /rerank contracts
@@ -501,16 +622,23 @@ not as a service and not as an "orphan". Use dcm model up|down only when you
 intend to restart the LLM as well; that also restarts the service this Codex
 session is served by.
 
-Reranker sizing (measured on this box):
-  POST /rerank with 30 docs x ~600 tokens is Maple Chat's real rerank shape
-  (rerank_limit=30, chunk target 550 / max 700 tokens) and needs about 18k
-  tokens in one request. With --max-batch-tokens 4096 TEI answers
-  429 {"error":"Model is overloaded"}, so the default is 20480.
-  Embeddings cap one request at --max-client-batch-size 32.
+Reranker sizing (measured on this box; two knobs are traps):
+  429 "Model is overloaded" is a PERMIT limit. At --max-concurrent-requests 16
+  any /rerank request with >16 inputs failed at any length (30 x ~100 tokens and
+  30 x ~600 tokens both failed; 16 x ~50 tokens passed). At 64 permits every
+  shape passes: 30 x ~600 tokens = 200 OK in ~1.2 s warm. Keep
+  --max-concurrent-requests >= --max-client-batch-size; dcm refuses a violating
+  config with exit 2.
+  --max-batch-tokens is bounded by the GPU: 20480 made candle fail CUDA init with
+  CUDA_ERROR_OUT_OF_MEMORY and TEI silently served CPU. 8192 boots on CUDA here.
+  Embeddings cap one request at --max-client-batch-size 32 (422 above that).
+  Latency is ~linear in document tokens, and TEI does not truncate to the
+  reranker's 512-position limit, so truncate rerank docs client-side to ~512
+  tokens to roughly halve rerank latency.
 
 Overrides:
   DCM_RERANKER_IMAGE / DCM_RERANKER_PORT / DCM_RERANKER_MODEL / _MODEL_REVISION
-  DCM_RERANKER_MAX_BATCH_TOKENS (default 20480) / _MAX_BATCH_REQUESTS (8)
+  DCM_RERANKER_MAX_BATCH_TOKENS (default 8192) / _MAX_BATCH_REQUESTS (8)
   DCM_RERANKER_MAX_CLIENT_BATCH_SIZE (64) / _MAX_CONCURRENT_REQUESTS (16)
   DCM_EMBEDDING_* as before, DCM_ENCODERS_PROJECT to rename the project.
 
@@ -547,6 +675,7 @@ PYEOF
 
 cmd_encoders_validate() {
     local rc=0
+    encoders_budget_invariants || rc=1
     echo "Embedding contract (http://127.0.0.1:${EMBEDDING_PORT}):"
     embedding_contract_ready && echo "  OK: /info attestation + 2 inputs -> 1024-dim normalized vectors" || { echo "  FAILED" >&2; rc=1; }
     echo "Reranker contract (http://127.0.0.1:${RERANKER_PORT}):"
@@ -564,6 +693,7 @@ cmd_encoders() {
     [[ $# -eq 0 ]] || shift
     case "$subcommand" in
         up) start_encoders ;;
+        migrate) cmd_encoders_migrate ;;
         down) stop_encoders ;;
         restart) encoders_compose up -d --force-recreate embedding reranker && start_encoders ;;
         status) encoders_compose ps; report_encoder_backends ;;

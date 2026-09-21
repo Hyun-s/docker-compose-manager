@@ -155,24 +155,48 @@ Docker 안의 클라이언트는 `http://dcm-embedding:80/v1`,
 프로젝트가 통신할 수 있습니다. 이 네트워크는 `dcm encoders up`(또는
 `dcm model up`)이 인코더를 시작할 때 생성됩니다.
 
-#### reranker 배치 사이징: 429의 실제 원인
+#### reranker 429의 실제 원인은 permit 수였다 (VRAM도 토큰 예산도 아님)
 
-`--max-batch-tokens`를 작게 걸면 요청이 밀려도 안전할 것처럼 보이지만, 실제
-Maple Chat rerank 요청은 `rerank_limit=30` 후보 × chunk target 550 / max 700
-token, 즉 **한 요청에 약 18k token**입니다. 4096으로 두고 실측한 결과:
+Maple Chat의 실제 rerank 요청은 `rerank_limit=30` 후보 × chunk target 550 /
+max 700 token입니다. `--max-concurrent-requests 16`으로 두었을 때 실측:
 
 | 요청 형태 | 결과 |
 |-----------|------|
-| `POST /rerank` 4 doc × 200 token | 200 OK, 202 ms |
-| 30 doc admitted (실측 로그) | `inference_time=9.9 ms`, `total_time=17.5 ms` |
-| `POST /rerank` 30 doc × ~600 token | **429 `{"error":"Model is overloaded"}`** |
+| `/rerank` 16 doc × ~50 token | 200 OK |
+| `/rerank` 20 doc × ~50 token | **429 `Model is overloaded`** |
+| `/rerank` 30 doc × ~100 token | **429** (총 토큰수가 예산보다 작아도 실패) |
+| `/rerank` 30 doc × ~600 token | **429** |
+
+입력 **개수**가 16을 넘는 순간 길이와 무관하게 실패했습니다. 원인은 TEI의
+inference permit이 `max_concurrent_requests`로 제한되기 때문입니다. permits를
+64로 올린 뒤 같은 서버에서 같은 요청이 모두 통과했습니다
+(`--max-batch-tokens 8192`, CUDA):
+
+| 요청 형태 | 결과 |
+|-----------|------|
+| `/rerank` 30 doc × ~600 token | 200 OK, warm ~1.21 s |
+| `/rerank` 30 doc × ~900 token | 200 OK, 2.02 s |
+| `/rerank` 64 doc × ~600 token | 200 OK, 2.58 s |
+| `/rerank` 4 doc × ~50 token | 200 OK, 31 ms |
 | `/v1/embeddings` 1 doc | 200 OK, warm 141 ms |
 | `/v1/embeddings` 32 doc × ~600 token | 200 OK, 1308 ms |
 | `/v1/embeddings` 64 doc | 422 `batch size 64 > maximum allowed batch size 32` |
 
-원인은 GPU 부족이 아니라 TEI의 배치/permit 포화였습니다. 그래서 reranker
-기본값을 `DCM_RERANKER_MAX_BATCH_TOKENS=20480`(실 요청 1회 분량)으로 올렸습니다.
-임베딩 쪽은 client batch 상한이 32이므로, 한 요청에 32개를 넘기면 4096이 아니라
+남은 지연은 토큰 길이에 거의 선형입니다(200 tok→403 ms, 600 tok→1.42 s).
+bge-reranker-v2-m3는 512 position 모델이지만 TEI는 `max_input_length=8192`까지
+잘라주지 않으므로, 700 token chunk를 그대로 넘기면 버려지는 계산에 1.2초를
+냅니다. 클라이언트 쪽에서 rerank 대상 문서를 512 token 이하로 자르면 절반
+수준으로 줄어듭니다.
+
+두 개의 불변식을 `dcm`이 강제합니다.
+
+- `--max-concurrent-requests >= --max-client-batch-size`: 위반 시 시작을
+  거부합니다(exit 2). 어기면 쿼리 시점에 429가 확정입니다.
+- `--max-batch-tokens`는 GPU가 상한입니다. 20480으로 올렸을 때 candle이 CUDA
+  init에서 `CUDA_ERROR_OUT_OF_MEMORY`로 실패했고 TEI는 조용히 CPU로 강등됐습니다
+  (CPU는 `max_batch_requests`도 4로 제한). 이 상자에서는 8192가 CUDA로 뜹니다.
+
+임베딩 쪽은 client batch 상한이 32이므로 한 요청에 32개를 넘기면 429가 아니라
 **422**로 실패합니다. 클라이언트 쪽 배치 분할은 Maple Chat의 몫입니다.
 
 간단한 embedding 확인 요청:

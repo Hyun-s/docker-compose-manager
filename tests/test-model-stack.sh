@@ -240,6 +240,21 @@ set -e
 unset FAKE_BAD_RERANKER_CONTRACT
 [[ "$rc" -ne 0 ]] || fail 'encoders validate must fail on an unattested reranker'
 
+# --------------------------- max_concurrent_requests >= max_client_batch_size
+# A client batch larger than the permit pool is a guaranteed 429 at query time,
+# so dcm must refuse to start that configuration rather than fail later.
+: >"$EVENTS"
+set +e
+DCM_RERANKER_MAX_CONCURRENT_REQUESTS=16 DCM_RERANKER_MAX_CLIENT_BATCH_SIZE=64 \
+  "$ROOT/docker-compose-manager.sh" encoders up >"$TMP/permit-guard" 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail 'an unsatisfiable permit budget must be refused with exit 2'
+grep -q 'guaranteed 429' "$TMP/permit-guard"
+if grep -qF "<up>" "$EVENTS"; then
+  fail 'the permit-budget guard started containers instead of refusing'
+fi
+
 # ------------------------------------------- legacy single-service commands
 : >"$EVENTS"
 "$ROOT/docker-compose-manager.sh" up qwen38-27b --text-only

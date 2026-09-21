@@ -109,12 +109,20 @@ services:
     # for the RAG rerank stage instead of emitting vectors. Maple Chat reranks
     # up to `rerank_limit` (30) candidates per query, so client batch size stays
     # above that while batch tokens stay bounded.
-    # Sizing is measured, not guessed: Maple Chat reranks rerank_limit=30
-    # candidates whose chunks target 550 / cap 700 tokens, i.e. roughly 18k
-    # tokens per /rerank request. With --max-batch-tokens 4096 this service
-    # answered 429 {"error":"Model is overloaded"} for exactly that shape, while
-    # 4 x 200 tokens succeeded in 202 ms and a 30-candidate batch measured
-    # inference_time=9.9 ms once admitted. 20480 admits one real rerank batch.
+    # Sizing is measured, not guessed, and two of the obvious knobs are traps.
+    #
+    # 429 "Model is overloaded" is a PERMIT limit, not a token or VRAM limit.
+    # With --max-concurrent-requests 16 this service refused any request with
+    # more than 16 inputs at ANY length: 30 x ~600 tokens and 30 x ~100 tokens
+    # both failed, while 16 x ~50 tokens succeeded. Raising permits to 64 made
+    # every shape pass. Keep --max-concurrent-requests >= --max-client-batch-size
+    # (dcm enforces this invariant), otherwise a legal client batch is a
+    # guaranteed 429.
+    #
+    # --max-batch-tokens is bounded by the GPU, not by the workload: raising it to
+    # 20480 made candle fail CUDA init with CUDA_ERROR_OUT_OF_MEMORY and TEI then
+    # silently served the model on CPU, which also caps max_batch_requests at 4.
+    # 8192 boots on CUDA on this box.
     command:
       - --model-id
       - "${DCM_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}"
@@ -125,13 +133,13 @@ services:
       - --dtype
       - float16
       - --max-batch-tokens
-      - "${DCM_RERANKER_MAX_BATCH_TOKENS:-20480}"
+      - "${DCM_RERANKER_MAX_BATCH_TOKENS:-8192}"
       - --max-batch-requests
       - "${DCM_RERANKER_MAX_BATCH_REQUESTS:-8}"
       - --max-client-batch-size
       - "${DCM_RERANKER_MAX_CLIENT_BATCH_SIZE:-64}"
       - --max-concurrent-requests
-      - "${DCM_RERANKER_MAX_CONCURRENT_REQUESTS:-16}"
+      - "${DCM_RERANKER_MAX_CONCURRENT_REQUESTS:-64}"
       - --auto-truncate
       - "true"
 
