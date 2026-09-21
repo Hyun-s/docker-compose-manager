@@ -1,0 +1,19 @@
+# nested independent repos
+/DGX_Spark_Qwen3.8-Flash-Next/
+/DGX_Spark_Qwen3.8-Flash-Next-dolf/
+# local runtime state / caches
+.omx/
+.claude/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+# secrets & local overrides
+.env
+*.env
+!*.env.example
+HF_TOKEN*
+# editor/backup cruft
+*.orig
+*.bak
+*~

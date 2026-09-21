@@ -1,0 +1,41 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:nightly-aarch64
+    container_name: vllm-local-coder
+    network_mode: host
+    ipc: host
+
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+
+    environment:
+      HF_TOKEN: "${HF_TOKEN:-}"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # QWEN38_MODEL_MODE_ARGS is controlled by docker-compose-manager.sh.
+    # Default: text-only (--language-model-only). With --vision it is empty,
+    # so vLLM also loads the model's vision encoder.
+    entrypoint:
+      - /bin/sh
+      - -lc
+    command:
+      - >-
+        exec vllm serve Qwen/Qwen3.8-27B
+        --served-model-name local-coder
+        --host 0.0.0.0
+        --port 8001
+        --max-model-len 131072
+        --gpu-memory-utilization 0.70
+        --kv-cache-dtype fp8
+        --reasoning-parser qwen3
+        --enable-auto-tool-choice
+        --tool-call-parser qwen3_coder
+        --default-chat-template-kwargs '{"enable_thinking":false}'
+        ${QWEN38_MODEL_MODE_ARGS---language-model-only}

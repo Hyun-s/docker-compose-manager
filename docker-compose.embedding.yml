@@ -1,0 +1,59 @@
+services:
+  embedding:
+    image: "${DCM_EMBEDDING_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:121-1.9@sha256:a8f7f1b33b18a8a8d87b9f16268803ce83c9b4dd33fc05424b3b5375bf18c85c}"
+    container_name: dcm-embedding-bge-m3
+    ipc: host
+    shm_size: 1gb
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${DCM_EMBEDDING_PORT:-8081}:80"
+
+    networks:
+      model-plane:
+        aliases:
+          - dcm-embedding
+
+    volumes:
+      - ~/.cache/huggingface:/data
+
+    environment:
+      HF_TOKEN: "${HF_TOKEN:-}"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # TEI 1.9 publishes a GB10/sm_121 multi-arch image. Unlike a second
+    # generative vLLM instance, this encoder does not reserve a KV cache. The
+    # activation workload is bounded explicitly while the primary LLM keeps
+    # every existing --gpu-memory-utilization value unchanged.
+    command:
+      - --model-id
+      - "${DCM_EMBEDDING_MODEL:-BAAI/bge-m3}"
+      - --revision
+      - "${DCM_EMBEDDING_MODEL_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}"
+      - --served-model-name
+      - "${DCM_EMBEDDING_MODEL_ALIAS:-bge-m3}"
+      - --pooling
+      - cls
+      - --dtype
+      - float16
+      - --max-input-length
+      - "8192"
+      - --max-batch-tokens
+      - "${DCM_EMBEDDING_MAX_BATCH_TOKENS:-8192}"
+      - --max-batch-requests
+      - "${DCM_EMBEDDING_MAX_BATCH_REQUESTS:-16}"
+      - --max-client-batch-size
+      - "${DCM_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-16}"
+      - --max-concurrent-requests
+      - "${DCM_EMBEDDING_MAX_CONCURRENT_REQUESTS:-32}"
+
+networks:
+  model-plane:
+    name: dcm-model-plane

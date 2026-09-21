@@ -1,0 +1,45 @@
+services:
+  vllm:
+    image: vllm-qwen35-v2
+    container_name: vllm-local-coder
+    network_mode: host
+    ipc: host
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ~/models:/models
+    command:
+      - serve
+      - /models/qwen35-122b-hybrid-int4fp8
+      - --served-model-name
+      - local-coder
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --limit-mm-per-prompt
+      - '{"image": 1}'  # 프롬프트당 허용할 최대 이미지 수 (필요시 2, 3 등으로 상향)
+      - --max-model-len
+      - "262144"
+      - --gpu-memory-utilization
+      - "0.88"
+      - --load-format
+      - fastsafetensors
+      - --attention-backend
+      - FLASHINFER
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":2}'
+      - --enable-chunked-prefill
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_xml
+      - --generation-config
+      - auto
+      - --override-generation-config
+      - '{"temperature":0.7,"top_p":0.8,"top_k":20,"presence_penalty":0.0,"repetition_penalty":1.0}'
