@@ -17,3 +17,6 @@ HF_TOKEN*
 *.orig
 *.bak
 *~
+
+# personal documents, never publish
+PI-harness/
