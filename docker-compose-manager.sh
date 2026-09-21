@@ -12,6 +12,17 @@ EMBEDDING_MODEL="${DCM_EMBEDDING_MODEL:-BAAI/bge-m3}"
 EMBEDDING_MODEL_REVISION="${DCM_EMBEDDING_MODEL_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}"
 EMBEDDING_MODEL_ALIAS="${DCM_EMBEDDING_MODEL_ALIAS:-bge-m3}"
 EMBEDDING_PORT="${DCM_EMBEDDING_PORT:-8081}"
+RERANKER_MODEL="${DCM_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}"
+RERANKER_MODEL_REVISION="${DCM_RERANKER_MODEL_REVISION:-953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e}"
+RERANKER_MODEL_ALIAS="${DCM_RERANKER_MODEL_ALIAS:-bge-reranker-v2-m3}"
+RERANKER_PORT="${DCM_RERANKER_PORT:-8082}"
+# The encoder Compose project MUST stay separate from the LLM Compose project.
+# All three containers currently share project "local-claude-code", so a
+# `docker compose -f docker-compose.embedding.yml down` while they share a
+# project stops vllm-local-coder too - which kills the Codex session that is
+# served by that very container. Every encoder command therefore pins -p.
+ENCODERS_PROJECT="${DCM_ENCODERS_PROJECT:-dcm-model-plane}"
+ENCODER_CONTAINERS=(dcm-embedding-bge-m3 dcm-reranker-bge-v2-m3)
 MODEL_READY_TIMEOUT="${DCM_MODEL_READY_TIMEOUT:-1800}"
 MODEL_READY_POLL_SECONDS="${DCM_MODEL_READY_POLL_SECONDS:-5}"
 CONFIGS=(
@@ -37,7 +48,8 @@ Commands:
   restart  Restart the service
   logs     Show logs (options: -f for follow, -n <lines> for last N lines)
   ps       Show running vllm containers
-  model    Manage the LLM + BGE-M3 embedding stack (up/down/status/logs)
+  model    Manage the full LLM + encoder stack (up/down/status/logs) - restarts the LLM too
+  encoders Manage only the always-on TEI encoders (BGE-M3 + BGE-reranker-v2-m3)
   gpu-job  Stop vLLM, run an exclusive GPU task, then restore vLLM
   h, help  Show this help message
 
@@ -77,6 +89,8 @@ Examples:
   $0 model up qwen38-flash-next --vision
   $0 model status qwen38-flash-next
   $0 model down qwen38-flash-next
+  $0 encoders status            # encoders only; never touches the LLM container
+  $0 encoders validate          # live /info + /v1/embeddings + /rerank contract probe
   $0 gpu-job run -- ./train_lora.sh
   $0 gpu-job status
   $0 gpu-job recover       # Restore vLLM after an interrupted/killed wrapper
@@ -87,12 +101,16 @@ EOF
 
 show_model_help() {
     cat << EOF
-Manage the local LLM and BGE-M3 embedding servers as one stack.
+Manage the local LLM and both always-on TEI encoders (BGE-M3 embedding +
+BGE-reranker-v2-m3) as one stack. Use `dcm encoders` instead whenever you do NOT
+intend to restart the LLM: this command's `down` stops the LLM too, and that is
+the container serving the interactive agent session.
 
 Usage:
   dcm model up [config] [LLM options]
   dcm model down [config]
-  dcm model status [config]
+  dcm model status [config]      # includes CUDA-vs-CPU backend + MemAvailable
+  dcm encoders status            # encoders only; never converges the LLM
   dcm model logs [config] [docker compose log options]
 
 The LLM starts first and must answer its OpenAI-compatible model endpoint before
@@ -241,19 +259,137 @@ wait_for_embedding_model() {
     return 1
 }
 
-model_compose() {
-    local config_name="$1"
-    shift
-    local config_file
-    config_file=$(get_config_file "$config_name") || {
-        echo "Error: Unknown config '$config_name'" >&2
-        list_configs >&2
+# Converge ONLY the TEI encoders. This never loads an LLM Compose file and
+# always pins its own project name, so vllm-local-coder can never be selected
+# as a service to stop, restart, or remove as an "orphan".
+encoders_compose() {
+    [[ -f "$SCRIPT_DIR/$EMBEDDING_COMPOSE_FILE" ]] || {
+        echo "Error: encoder Compose file is missing: $SCRIPT_DIR/$EMBEDDING_COMPOSE_FILE" >&2
         return 1
     }
-    docker compose \
-        -f "$SCRIPT_DIR/$config_file" \
+    docker compose -p "$ENCODERS_PROJECT" \
         -f "$SCRIPT_DIR/$EMBEDDING_COMPOSE_FILE" \
         "$@"
+}
+
+validate_rerank_response() {
+    python3 -c '
+import json, math, sys
+payload = json.load(sys.stdin)
+expected_count = int(sys.argv[1])
+# TEI 1.9 answers POST /rerank with a BARE ARRAY sorted by score descending and
+# returns 404 for /v1/rerank, so do not accept the {results:[...]} vLLM shape
+# here; the Maple Chat client handles that shape separately.
+if not isinstance(payload, list):
+    raise SystemExit("rerank response is not a bare array")
+if len(payload) != expected_count:
+    raise SystemExit("rerank response count mismatch")
+indices = [item.get("index") for item in payload]
+if sorted(indices) != list(range(expected_count)):
+    raise SystemExit("rerank response index set mismatch")
+scores = [item.get("score") for item in payload]
+if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in scores):
+    raise SystemExit("rerank contains non-finite scores")
+if scores != sorted(scores, reverse=True):
+    raise SystemExit("rerank scores are not sorted descending")
+' "$1"
+}
+
+reranker_contract_ready() {
+    local info
+    info=$(curl -fsS --connect-timeout 1 --max-time 3 \
+        "http://127.0.0.1:${RERANKER_PORT}/info") || return 1
+    python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+expected_model, expected_sha = sys.argv[1:3]
+if payload.get("model_id") != expected_model:
+    raise SystemExit("unexpected TEI reranker model_id")
+if payload.get("model_sha") != expected_sha:
+    raise SystemExit("unexpected TEI reranker model_sha")
+' "$RERANKER_MODEL" "$RERANKER_MODEL_REVISION" <<<"$info" >/dev/null 2>&1 || return 1
+    curl -fsS --connect-timeout 1 --max-time 60 \
+        -H 'Content-Type: application/json' \
+        -X POST \
+        -d "{\"model\":\"${RERANKER_MODEL_ALIAS}\",\"query\":\"경험치 효율\",\"texts\":[\"경험치 효율이 좋은 던전 배치\",\"상점 물품 가격표\",\"채널 이동 안내\"]}" \
+        "http://127.0.0.1:${RERANKER_PORT}/rerank" \
+        | validate_rerank_response 3 >/dev/null 2>&1
+}
+
+wait_for_reranker_model() {
+    local timeout="$1" deadline
+    [[ "$timeout" =~ ^[0-9]+$ ]] || {
+        echo "Error: DCM_MODEL_READY_TIMEOUT must be a non-negative integer" >&2
+        return 2
+    }
+    command -v python3 >/dev/null || {
+        echo "Error: python3 is required for reranker contract validation" >&2
+        return 2
+    }
+    deadline=$(( $(date +%s) + timeout ))
+    while (( $(date +%s) <= deadline )); do
+        if curl -fsS --connect-timeout 1 --max-time 3 \
+            "http://127.0.0.1:${RERANKER_PORT}/health" >/dev/null 2>&1 && \
+            reranker_contract_ready; then
+            echo "Reranker model is ready at http://127.0.0.1:${RERANKER_PORT}"
+            return 0
+        fi
+        sleep "$MODEL_READY_POLL_SECONDS"
+    done
+    echo "Error: timed out waiting for the verified reranker contract on http://127.0.0.1:${RERANKER_PORT}" >&2
+    return 1
+}
+
+# TEI silently falls back to CPU when it cannot get a CUDA context on the GB10
+# unified-memory device. Latency stays tolerable for a single query but the
+# always-on premise is defeated, so surface the actual backend and the host
+# memory headroom instead of pretending the model is on the GPU.
+report_encoder_backends() {
+    local container backend failed=0
+    for container in "${ENCODER_CONTAINERS[@]}"; do
+        docker inspect "$container" >/dev/null 2>&1 || { echo "  $container: absent"; continue; }
+        backend=$(docker logs "$container" 2>&1 \
+            | grep -Eo 'Starting [A-Za-z]+ model on (Cuda\([A-Za-z0-9()]*\)|Cpu)|Using CPU instead' \
+            | tail -1 || true)
+        case "$backend" in
+            *Cuda*) echo "  $container: GPU (${backend})" ;;
+            *Cpu*|*CPU*) echo "  $container: CPU FALLBACK (${backend}) - model is NOT on the GPU" >&2; failed=1 ;;
+            *) echo "  $container: backend unknown (still loading?)" ;;
+        esac
+    done
+    local avail_gib
+    avail_gib=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo)
+    echo "  host MemAvailable: ${avail_gib} GiB"
+    if (( $(awk -v v="$avail_gib" 'BEGIN{print (v<8)?1:0}') )); then
+        echo "  Warning: MemAvailable below 8 GiB; TEI may refuse CUDA and fall back to CPU." >&2
+        failed=1
+    fi
+    return "$failed"
+}
+
+start_encoders() {
+    echo "Starting TEI encoders (project: $ENCODERS_PROJECT)..."
+    if ! encoders_compose up -d --no-deps embedding reranker; then
+        echo "Error: encoder services failed to start; the LLM was left running" >&2
+        return 70
+    fi
+    if ! wait_for_embedding_model "$MODEL_READY_TIMEOUT"; then
+        echo "Embedding readiness failed; stopping only the embedding service." >&2
+        encoders_compose stop embedding >/dev/null 2>&1 || true
+        return 70
+    fi
+    if ! wait_for_reranker_model "$MODEL_READY_TIMEOUT"; then
+        echo "Reranker readiness failed; stopping only the reranker service." >&2
+        encoders_compose stop reranker >/dev/null 2>&1 || true
+        return 70
+    fi
+    report_encoder_backends || true
+    echo "Encoders are ready: $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+}
+
+stop_encoders() {
+    echo "Stopping TEI encoders (project: $ENCODERS_PROJECT; the LLM is untouched)..."
+    encoders_compose down --remove-orphans
 }
 
 cmd_model_up() {
@@ -266,28 +402,16 @@ cmd_model_up() {
         list_configs >&2
         return 1
     }
-    [[ -f "$SCRIPT_DIR/$EMBEDDING_COMPOSE_FILE" ]] || {
-        echo "Error: embedding Compose file is missing: $SCRIPT_DIR/$EMBEDDING_COMPOSE_FILE" >&2
-        return 1
-    }
 
     # vLLM computes its requested memory budget at startup. Starting it before
-    # the smaller TEI encoder avoids the embedding process reducing the free
-    # memory visible to the primary model.
+    # the smaller TEI encoders avoids the encoder processes reducing the free
+    # memory visible to the primary model, so every existing
+    # --gpu-memory-utilization value stays unchanged.
     cmd_up "$config_name" "$@"
     wait_for_openai_model "LLM" "$(llm_api_port "$config_name")" "local-coder" "$MODEL_READY_TIMEOUT"
 
-    echo "Starting BGE-M3 embedding service after the LLM is ready..."
-    if ! model_compose "$config_name" up -d --no-deps embedding; then
-        echo "Error: embedding service failed to start; the LLM was left running" >&2
-        return 70
-    fi
-    if ! wait_for_embedding_model "$MODEL_READY_TIMEOUT"; then
-        echo "Embedding readiness failed; stopping only the embedding service." >&2
-        model_compose "$config_name" stop embedding >/dev/null 2>&1 || true
-        return 70
-    fi
-    echo "Model stack is ready: LLM + $EMBEDDING_MODEL_ALIAS."
+    start_encoders || return 70
+    echo "Model stack is ready: LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
 }
 
 cmd_model_down() {
@@ -296,8 +420,9 @@ cmd_model_down() {
         echo "Error: model down accepts only an optional config name" >&2
         return 2
     }
-    echo "Stopping LLM + embedding model stack..."
-    model_compose "$config_name" down
+    echo "Stopping LLM + encoder model stack..."
+    encoders_compose down >/dev/null 2>&1 || true
+    cmd_down "$config_name"
     echo "Model stack stopped."
 }
 
@@ -307,7 +432,17 @@ cmd_model_status() {
         echo "Error: model status accepts only an optional config name" >&2
         return 2
     }
-    model_compose "$config_name" ps
+    local config_file
+    config_file=$(get_config_file "$config_name") || {
+        echo "Error: Unknown config '$config_name'" >&2
+        return 1
+    }
+    echo "LLM service ($config_name):"
+    docker compose -f "$SCRIPT_DIR/$config_file" ps
+    echo "Encoder services (project: $ENCODERS_PROJECT):"
+    encoders_compose ps
+    echo "Encoder compute backend / memory headroom:"
+    report_encoder_backends
 }
 
 cmd_model_logs() {
@@ -321,7 +456,13 @@ cmd_model_logs() {
         fi
         shift
     done
-    model_compose "$config_name" logs "${log_args[@]}"
+    local config_file
+    config_file=$(get_config_file "$config_name") || {
+        echo "Error: Unknown config '$config_name'" >&2
+        return 1
+    }
+    docker compose -f "$SCRIPT_DIR/$config_file" logs "${log_args[@]}"
+    encoders_compose logs "${log_args[@]}"
 }
 
 cmd_model() {
@@ -336,6 +477,103 @@ cmd_model() {
         *)
             echo "Error: unknown model command '$subcommand'" >&2
             show_model_help >&2
+            return 2
+            ;;
+    esac
+}
+
+show_encoders_help() {
+    cat << EOF
+Manage ONLY the always-on TEI encoders (BGE-M3 embedding + BGE-reranker-v2-m3).
+
+Usage:
+  dcm encoders up        Start embedding + reranker (contract-validated, no LLM touched)
+  dcm encoders down      Stop them (Compose project $ENCODERS_PROJECT only)
+  dcm encoders restart   Recreate them
+  dcm encoders status    ps + CUDA/CPU backend + MemAvailable headroom
+  dcm encoders logs      docker compose logs for both encoders
+  dcm encoders validate  Probe the live /info, /v1/embeddings and /rerank contracts
+  dcm encoders probe     Replay Maple Chat's real 30 x ~600 token rerank shape
+
+Safety contract: every command here pins Compose project "$ENCODERS_PROJECT" and
+never loads an LLM Compose file, so vllm-local-coder can never be converged -
+not as a service and not as an "orphan". Use dcm model up|down only when you
+intend to restart the LLM as well; that also restarts the service this Codex
+session is served by.
+
+Reranker sizing (measured on this box):
+  POST /rerank with 30 docs x ~600 tokens is Maple Chat's real rerank shape
+  (rerank_limit=30, chunk target 550 / max 700 tokens) and needs about 18k
+  tokens in one request. With --max-batch-tokens 4096 TEI answers
+  429 {"error":"Model is overloaded"}, so the default is 20480.
+  Embeddings cap one request at --max-client-batch-size 32.
+
+Overrides:
+  DCM_RERANKER_IMAGE / DCM_RERANKER_PORT / DCM_RERANKER_MODEL / _MODEL_REVISION
+  DCM_RERANKER_MAX_BATCH_TOKENS (default 20480) / _MAX_BATCH_REQUESTS (8)
+  DCM_RERANKER_MAX_CLIENT_BATCH_SIZE (64) / _MAX_CONCURRENT_REQUESTS (16)
+  DCM_EMBEDDING_* as before, DCM_ENCODERS_PROJECT to rename the project.
+
+Examples:
+  dcm encoders status
+  dcm encoders validate
+  dcm encoders up
+EOF
+}
+
+cmd_encoders_probe() {
+    local rc=0
+    echo "Rerank load probe (30 x ~600 tokens, the Maple Chat shape):"
+    python3 - "$RERANKER_PORT" <<'PYEOF' || rc=1
+import json, sys, urllib.request, urllib.error
+port = sys.argv[1]
+unit = (" Maple 스토리윕의 던전 배치와 몬스터 스폰 주기는 경험치 효율에 직접적인 "
+        "영향을 주며, 파티원 수와 채널 분산에 따라 보상 배율이 달라진다. ")
+doc = (unit * 4)[:2400]
+body = json.dumps({"model": "bge-reranker-v2-m3",
+                   "query": "경험치 효율이 가장 좋은 던전 배치는?",
+                   "texts": [doc] * 30}).encode()
+req = urllib.request.Request(f"http://127.0.0.1:{port}/rerank", data=body,
+                             headers={"Content-Type": "application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req, timeout=180) as r:
+        scores = json.loads(r.read())
+    print(f"  OK: 30 x ~600 tokens scored, {len(scores)} results")
+except urllib.error.HTTPError as exc:
+    raise SystemExit(f"FAILED: HTTP {exc.code} {exc.read()[:120].decode('utf8', 'replace')}")
+PYEOF
+    return "$rc"
+}
+
+cmd_encoders_validate() {
+    local rc=0
+    echo "Embedding contract (http://127.0.0.1:${EMBEDDING_PORT}):"
+    embedding_contract_ready && echo "  OK: /info attestation + 2 inputs -> 1024-dim normalized vectors" || { echo "  FAILED" >&2; rc=1; }
+    echo "Reranker contract (http://127.0.0.1:${RERANKER_PORT}):"
+    reranker_contract_ready && echo "  OK: /info attestation + /rerank bare-array 3 scores sorted DESC" || { echo "  FAILED" >&2; rc=1; }
+    if [[ "${DCM_SKIP_LOAD_PROBE:-0}" == 1 ]]; then
+        echo "Rerank load probe skipped (DCM_SKIP_LOAD_PROBE=1)."
+        return "$rc"
+    fi
+    cmd_encoders_probe || rc=1
+    return "$rc"
+}
+
+cmd_encoders() {
+    local subcommand="${1:-help}"
+    [[ $# -eq 0 ]] || shift
+    case "$subcommand" in
+        up) start_encoders ;;
+        down) stop_encoders ;;
+        restart) encoders_compose up -d --force-recreate embedding reranker && start_encoders ;;
+        status) encoders_compose ps; report_encoder_backends ;;
+        logs) encoders_compose logs "$@" ;;
+        validate) cmd_encoders_validate ;;
+        probe) cmd_encoders_probe ;;
+        h|help|-h|--help) show_encoders_help ;;
+        *)
+            echo "Error: unknown encoders command '$subcommand'" >&2
+            show_encoders_help >&2
             return 2
             ;;
     esac
@@ -546,6 +784,9 @@ case "$command" in
         ;;
     model)
         cmd_model "$@"
+        ;;
+    encoders)
+        cmd_encoders "$@"
         ;;
     gpu-job)
         cmd_gpu_job "$@"

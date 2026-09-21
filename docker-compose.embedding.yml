@@ -1,3 +1,26 @@
+# dcm model-plane encoders (TEI).
+#
+# These two services are the *encoder half* of the always-on model plane. They
+# live in their own Compose file so they can be converged without ever touching
+# the vLLM service: the interactive Codex session itself is served by that vLLM
+# container, so any up/down/restart that converges the LLM service is a
+# self-inflicted outage. Use `dcm encoders ...` for this file.
+#
+# Image: TEI 1.9 "121" (sm_121 / GB10) CUDA build, arm64/sbsa, pinned by digest.
+# Verified against this exact digest via `text-embeddings-router --help`:
+#   * --max-input-length DOES NOT EXIST in this build; passing it makes clap
+#     exit 2 so the container never starts. Bound the workload with
+#     --max-batch-tokens + --auto-truncate instead.
+#   * --dtype accepts only float16|float32.
+#   * There is no --reranker flag: TEI infers the serving type from the model
+#     architecture, so a sequence-classification model such as
+#     BAAI/bge-reranker-v2-m3 is served as a reranker on POST /rerank.
+# Isolate the Compose project so converging the encoders can never converge the
+# LLM. Without this, this file shares project "local-claude-code" with
+# docker-compose.qwen38-flash-next.yml and `compose down` here also stops
+# vllm-local-coder - the container serving the interactive agent session.
+name: dcm-model-plane
+
 services:
   embedding:
     image: "${DCM_EMBEDDING_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:121-1.9@sha256:a8f7f1b33b18a8a8d87b9f16268803ce83c9b4dd33fc05424b3b5375bf18c85c}"
@@ -28,10 +51,9 @@ services:
               count: all
               capabilities: [gpu]
 
-    # TEI 1.9 publishes a GB10/sm_121 multi-arch image. Unlike a second
-    # generative vLLM instance, this encoder does not reserve a KV cache. The
-    # activation workload is bounded explicitly while the primary LLM keeps
-    # every existing --gpu-memory-utilization value unchanged.
+    # Unlike a second generative vLLM instance, this encoder reserves no KV
+    # cache, so the primary LLM keeps every existing --gpu-memory-utilization
+    # value unchanged. The activation workload is bounded explicitly.
     command:
       - --model-id
       - "${DCM_EMBEDDING_MODEL:-BAAI/bge-m3}"
@@ -43,16 +65,75 @@ services:
       - cls
       - --dtype
       - float16
-      - --max-input-length
-      - "8192"
       - --max-batch-tokens
       - "${DCM_EMBEDDING_MAX_BATCH_TOKENS:-8192}"
       - --max-batch-requests
-      - "${DCM_EMBEDDING_MAX_BATCH_REQUESTS:-16}"
+      - "${DCM_EMBEDDING_MAX_BATCH_REQUESTS:-8}"
       - --max-client-batch-size
-      - "${DCM_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-16}"
+      - "${DCM_EMBEDDING_MAX_CLIENT_BATCH_SIZE:-32}"
       - --max-concurrent-requests
       - "${DCM_EMBEDDING_MAX_CONCURRENT_REQUESTS:-32}"
+      - --auto-truncate
+      - "true"
+
+  reranker:
+    image: "${DCM_RERANKER_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:121-1.9@sha256:a8f7f1b33b18a8a8d87b9f16268803ce83c9b4dd33fc05424b3b5375bf18c85c}"
+    container_name: dcm-reranker-bge-v2-m3
+    ipc: host
+    shm_size: 1gb
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:${DCM_RERANKER_PORT:-8082}:80"
+
+    networks:
+      model-plane:
+        aliases:
+          - dcm-reranker
+
+    volumes:
+      - ~/.cache/huggingface:/data
+
+    environment:
+      HF_TOKEN: "${HF_TOKEN:-}"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # BGE-reranker-v2-m3 is a cross-encoder: it scores (query, document) pairs
+    # for the RAG rerank stage instead of emitting vectors. Maple Chat reranks
+    # up to `rerank_limit` (30) candidates per query, so client batch size stays
+    # above that while batch tokens stay bounded.
+    # Sizing is measured, not guessed: Maple Chat reranks rerank_limit=30
+    # candidates whose chunks target 550 / cap 700 tokens, i.e. roughly 18k
+    # tokens per /rerank request. With --max-batch-tokens 4096 this service
+    # answered 429 {"error":"Model is overloaded"} for exactly that shape, while
+    # 4 x 200 tokens succeeded in 202 ms and a 30-candidate batch measured
+    # inference_time=9.9 ms once admitted. 20480 admits one real rerank batch.
+    command:
+      - --model-id
+      - "${DCM_RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}"
+      - --revision
+      - "${DCM_RERANKER_MODEL_REVISION:-953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e}"
+      - --served-model-name
+      - "${DCM_RERANKER_MODEL_ALIAS:-bge-reranker-v2-m3}"
+      - --dtype
+      - float16
+      - --max-batch-tokens
+      - "${DCM_RERANKER_MAX_BATCH_TOKENS:-20480}"
+      - --max-batch-requests
+      - "${DCM_RERANKER_MAX_BATCH_REQUESTS:-8}"
+      - --max-client-batch-size
+      - "${DCM_RERANKER_MAX_CLIENT_BATCH_SIZE:-64}"
+      - --max-concurrent-requests
+      - "${DCM_RERANKER_MAX_CONCURRENT_REQUESTS:-16}"
+      - --auto-truncate
+      - "true"
 
 networks:
   model-plane:

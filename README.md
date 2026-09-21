@@ -30,7 +30,8 @@ dcm <command> [config] [options]
 | `restart`| 서비스 재시작 |
 | `logs`  | 로그 보기 |
 | `ps`    | 실행 중인 컨테이너 목록 |
-| `model` | LLM + BGE-M3 동시 서빙 스택 관리 |
+| `model` | LLM + TEI 인코더 전체 스택 관리 (LLM도 재시작됨) |
+| `encoders` | TEI 인코더(BGE-M3 + BGE-reranker)만 관리 — LLM 컨테이너는 절대 건드리지 않음 |
 | `help`  | 도움말 표시 |
 
 ### Configs
@@ -76,7 +77,13 @@ dcm down qwen38-27b
 dcm down qwen38-flash-next
 ```
 
-### LLM + BGE-M3 동시 서빙
+### LLM + BGE 인코더 상시 서빙
+
+> **먼저 알아둘 것:** 이 저장소를 사용하는 대화형 에이전트 세션 자체가
+> `vllm-local-coder` 컨테이너가 서빙하는 vLLM 위에서 동작합니다. 따라서 LLM
+> 서비스를 수렴(up/down/restart)하는 명령은 곧 자기 세션을 종료시키는 명령입니다.
+> 인코더만 다루려면 반드시 `dcm encoders`를 사용하고, `dcm model up|down`은
+> LLM까지 재시작 의도가 명시적인 경우에만 사용합니다.
 
 Maple Chat처럼 생성 모델과 vector embedding 모델이 동시에 필요한 경우에는
 `model` 하위 명령을 사용합니다. `model up`은 **LLM을 먼저 시작하고 readiness를
@@ -91,22 +98,82 @@ dcm model up qwen38-flash-next --vision
 dcm model status qwen38-flash-next
 dcm model logs -f qwen38-flash-next
 
-# 두 모델 모두 중지
+# 두 모델 모두 중지 (LLM까지 재시작되므로 주의)
 dcm model down qwen38-flash-next
 ```
+
+인코더만 다루려면 `encoders`를 사용합니다.
+
+```bash
+# BGE-M3 + BGE-reranker-v2-m3 만 시작/재창출 (LLM은 무변경)
+dcm encoders up
+dcm encoders restart
+
+# 컨테이너 상태 + 실제 연산 백엔드(CUDA vs CPU 강등) + 호스트 메모리 여유
+dcm encoders status
+
+# /info attestation, /v1/embeddings, /rerank 실계약 검증
+dcm encoders validate
+
+# Maple Chat의 실제 rerank 부하 형태(30 doc x ~600 token) 재현
+dcm encoders probe
+
+# 인코더만 중지 (Compose project dcm-model-plane 내부만 수렴)
+dcm encoders down
+```
+
+#### Compose project 격리 (왜 `encoders`가 별개로 존재하는가)
+
+`docker-compose.embedding.yml`은 top-level `name: dcm-model-plane`로 자기
+Compose project를 격리합니다. 격리 이전에는 LLM 파일과 같은 project
+(`local-claude-code`)를 공유했기 때문에, embedding 파일에 대한
+`docker compose down`이 **같은 project의 `vllm-local-coder`까지 중지**시켰습니다.
+`--remove-orphans`는 더 위험했습니다. `encoders_compose()`는 모든 호출에서
+`-p dcm-model-plane`을 고정하고 LLM Compose 파일을 아예 로드하지 않으므로,
+LLM 컨테이너가 서비스로도 orphan으로도 수렴될 수 없습니다. 이 계약은
+`tests/test-model-stack.sh`가 잠급니다(모든 encoder 호출의 `-p` 고정,
+`encoders *` 의 어떤 하위 명령도 LLM 파일을 참조하지 않음).
 
 API는 기본적으로 loopback에만 노출됩니다.
 
 - 생성 LLM: 기존 profile 주소 유지 (`qwen38-*`는 `http://127.0.0.1:8001/v1`)
-- BGE-M3 embedding: `http://127.0.0.1:8081/v1/embeddings`
-- embedding 모델 별칭: `bge-m3`
+- BGE-M3 embedding: `http://127.0.0.1:8081/v1/embeddings` (별칭 `bge-m3`, 1024차원)
+- BGE-reranker-v2-m3: `http://127.0.0.1:8082/rerank` (별칭 `bge-reranker-v2-m3`)
+
+reranker는 TEI 1.9에서 주의해서 다뤄야 합니다. 타입은 모델 아키텍처에서
+자동 추론되며 `--reranker` 플래그가 없습니다. rerank 엔드포인트는 origin root의
+`POST /rerank`이고 응답은 **정렬된 `[{index,score}]` 맨 배열**이며
+`/v1/rerank`는 404입니다. `GET /info`가 `model_id`/`model_sha`(=revision)와
+`model_type.reranker`를 돌려주므로 attestation에 사용합니다.
+
+Docker 안의 클라이언트는 `http://dcm-embedding:80/v1`,
+`http://dcm-reranker:80`을 사용합니다.
 
 호스트에서 실행하는 클라이언트는 위 loopback 주소를 사용합니다. Docker에서
-실행하는 Maple Chat은 `dcm-model-plane` 외부 네트워크에 연결한 뒤
-`http://dcm-embedding:80/v1`을 사용합니다. 따라서 TEI 포트를 LAN 전체에
-노출하지 않고도 두 Compose 프로젝트가 통신할 수 있습니다. 이 네트워크는
-`dcm model up`이 embedding 서비스를 시작할 때 생성되므로 DCM 모델 스택을
-먼저 시작합니다.
+실행하는 Maple Chat은 `dcm-model-plane` 외부 네트워크에 연결한 뒤 위 네트워크
+별칭을 사용합니다. 따라서 TEI 포트를 LAN 전체에 노출하지 않고도 두 Compose
+프로젝트가 통신할 수 있습니다. 이 네트워크는 `dcm encoders up`(또는
+`dcm model up`)이 인코더를 시작할 때 생성됩니다.
+
+#### reranker 배치 사이징: 429의 실제 원인
+
+`--max-batch-tokens`를 작게 걸면 요청이 밀려도 안전할 것처럼 보이지만, 실제
+Maple Chat rerank 요청은 `rerank_limit=30` 후보 × chunk target 550 / max 700
+token, 즉 **한 요청에 약 18k token**입니다. 4096으로 두고 실측한 결과:
+
+| 요청 형태 | 결과 |
+|-----------|------|
+| `POST /rerank` 4 doc × 200 token | 200 OK, 202 ms |
+| 30 doc admitted (실측 로그) | `inference_time=9.9 ms`, `total_time=17.5 ms` |
+| `POST /rerank` 30 doc × ~600 token | **429 `{"error":"Model is overloaded"}`** |
+| `/v1/embeddings` 1 doc | 200 OK, warm 141 ms |
+| `/v1/embeddings` 32 doc × ~600 token | 200 OK, 1308 ms |
+| `/v1/embeddings` 64 doc | 422 `batch size 64 > maximum allowed batch size 32` |
+
+원인은 GPU 부족이 아니라 TEI의 배치/permit 포화였습니다. 그래서 reranker
+기본값을 `DCM_RERANKER_MAX_BATCH_TOKENS=20480`(실 요청 1회 분량)으로 올렸습니다.
+임베딩 쪽은 client batch 상한이 32이므로, 한 요청에 32개를 넘기면 4096이 아니라
+**422**로 실패합니다. 클라이언트 쪽 배치 분할은 Maple Chat의 몫입니다.
 
 간단한 embedding 확인 요청:
 
@@ -147,6 +214,15 @@ DCM_EMBEDDING_MAX_BATCH_REQUESTS=8 \
 DCM_EMBEDDING_MAX_CONCURRENT_REQUESTS=16 \
   dcm model up qwen38-flash-next --vision
 ```
+
+GB10은 `nvidia-smi`에 메모리 합계를 `N/A`로 보고하기 때문에 통합 메모리 usage를
+직접 읽을 수 없습니다. 대신 `dcm encoders status`가 (1) TEI 로그에서 실제
+백엔드(`Starting FlashBert model on Cuda(...)` vs `Using CPU instead`),
+(2) `/proc/meminfo`의 `MemAvailable`을 드러냅니다. TEI는 CUDA 컨텍스트를
+못 얻으면 **조용히 CPU로 강등**되고, 상시 서빙 전제가 무너집니다.
+`MemAvailable`이 8 GiB 아래로 떨어지면 같은 강등이 일어나기 전의 신호입니다.
+실측 점유는 embedding 약 1368 MiB, reranker 약 1370 MiB이며 vLLM의
+`--gpu-memory-utilization 0.75`(약 97 GiB)는 그대로 유지됩니다.
 
 대규모 색인 재구축이나 학습처럼 GPU를 독점해야 하는 작업에서는 기존
 `dcm gpu-job run -- ...`을 그대로 사용합니다. dual-model stack이 실행 중이면
