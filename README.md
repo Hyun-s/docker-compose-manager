@@ -90,6 +90,12 @@ Maple Chat처럼 생성 모델과 vector embedding 모델이 동시에 필요한
 확인한 다음** 별도의 BGE-M3 TEI 서버를 시작합니다. 이 순서는 메인
 vLLM이 먼저 자신의 메모리 예산을 확보하도록 하기 위한 것입니다.
 
+`dcm model up`은 두 모델을 **하나의 명령으로** 올리고, 인코더가 CUDA에 올라갔는지를
+**기본으로 요구**합니다. 재창출 시도 후에도 CPU로 강등된 인코더가 남으면
+종료 코드 70으로 실패하며 "ready"를 출력하지 않습니다. CPU 서빙의 BGE가 바로
+이 평면이 없애려던 "답변 한 번에 1분" 증상이기 때문입니다. 일부러 느린 경로를
+쓰려는 경우에만 `DCM_REQUIRE_GPU=0`을 지정합니다.
+
 ```bash
 # 현재 사용 중인 Qwen3.8 Flash-Next + BGE-M3 시작
 dcm model up qwen38-flash-next --vision
@@ -502,6 +508,8 @@ tool로 실행하면 학습과 vLLM 복구가 끝날 때까지 tool call이 대�
 | `DCM_EMBEDDING_MAX_CLIENT_BATCH_SIZE` | 요청 1건의 input 개수 상한 (기본 `16`) | `dcm model` |
 | `DCM_EMBEDDING_MAX_CONCURRENT_REQUESTS` | 동시 요청 상한 (기본 `32`) | `dcm model` |
 | `DCM_MODEL_READY_TIMEOUT` | 각 모델 readiness 제한 초 (기본 `1800`) | `dcm model up` |
+| `DCM_REQUIRE_GPU` | 인코더 CUDA 필수 여부. 기본 `1`(요구), `0`만 CPU 강등 허용 | `dcm model up`, `dcm encoders up/restart` |
+| `DCM_GPU_START_ATTEMPTS` | CPU 강등 재창출 시도 횟수 (기본 `2`) | `dcm model up`, `dcm encoders up/restart` |
 
 설정 예시:
 ```bash

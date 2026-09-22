@@ -27,6 +27,15 @@ printf '\n' >>"$FAKE_EVENTS"
 if [[ "${FAKE_EMBED_UP_FAIL:-0}" == 1 && " $* " == *" up "* && " $* " == *" embedding "* ]]; then
   exit 1
 fi
+# TEI prints the backend it actually got; candle prints "Using CPU instead" when
+# it cannot create a CUDA context. Tests pick which world they live in.
+if [[ "${1:-}" == logs ]]; then
+  case "${FAKE_ENCODER_BACKEND:-unknown}" in
+    cpu) printf '%s\n' 'Using CPU instead' ;;
+    gpu) printf '%s\n' 'Starting FlashBert model on Cuda(CudaDevice(DeviceId(1)))' ;;
+  esac
+  exit 0
+fi
 EOF
 
 cat >"$TMP/bin/curl" <<'EOF'
@@ -100,6 +109,20 @@ grep -q '127.0.0.1:8081' "$TMP/model-help"
 "$ROOT/docker-compose-manager.sh" encoders h >"$TMP/enc-help"
 grep -q 'dcm encoders up' "$TMP/enc-help"
 grep -q 'dcm encoders validate' "$TMP/enc-help"
+grep -q 'DCM_REQUIRE_GPU' "$TMP/model-help"
+grep -q 'DCM_REQUIRE_GPU' "$TMP/enc-help"
+
+# The help blocks are expanding heredocs, so prose backticks there become command
+# substitutions: reading help must never run 'dcm model up' or 'dcm encoders'.
+: >"$EVENTS"
+"$ROOT/docker-compose-manager.sh" h >/dev/null
+"$ROOT/docker-compose-manager.sh" model h >/dev/null
+"$ROOT/docker-compose-manager.sh" encoders h >/dev/null
+[[ -s "$EVENTS" ]] && fail 'printing help executed a docker command'
+for help_file in help model-help enc-help; do
+  grep -q '`' "$TMP/$help_file" \
+    && fail "help text still contains a backtick command substitution: $help_file"
+done
 grep -q 'dcm-model-plane' "$TMP/enc-help"
 
 # ------------------------------------------------------- model up: LLM, then
@@ -253,6 +276,73 @@ set -e
 grep -q 'guaranteed 429' "$TMP/permit-guard"
 if grep -qF "<up>" "$EVENTS"; then
   fail 'the permit-budget guard started containers instead of refusing'
+fi
+
+# ------------------------------------------- GPU is the default, not a request
+# A CPU-served BGE is exactly the slow-answer bug this plane exists to fix, so an
+# unresolved fallback must fail the command instead of printing a healthy line.
+: >"$EVENTS"
+set +e
+FAKE_ENCODER_BACKEND=cpu DCM_GPU_START_ATTEMPTS=1 \
+  "$ROOT/docker-compose-manager.sh" encoders up >"$TMP/backend-cpu" 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 70 ]] || fail "a CPU-served encoder must exit 70, got $rc"
+grep -q 'GPU is required' "$TMP/backend-cpu"
+grep -q 'CPU FALLBACK' "$TMP/backend-cpu"
+grep -q 'fail-open' "$TMP/backend-cpu"
+if grep -q 'Encoders are ready' "$TMP/backend-cpu"; then
+  fail 'a CPU fallback printed "Encoders are ready"'
+fi
+# The gate must retry on GPU before giving up, not quit on the first CPU landing.
+grep -Fq '<up> <-d> <--force-recreate> <embedding> <reranker>' "$EVENTS" \
+  || fail 'the GPU gate never recreated the CPU-served encoders'
+if grep -qF "<$LLM_FILE>" "$EVENTS"; then
+  fail 'the GPU gate referenced an LLM Compose file'
+fi
+
+: >"$EVENTS"
+FAKE_ENCODER_BACKEND=gpu DCM_GPU_START_ATTEMPTS=1 \
+  "$ROOT/docker-compose-manager.sh" encoders up >"$TMP/backend-gpu"
+grep -q 'Encoders are ready on GPU' "$TMP/backend-gpu"
+if grep -q 'CPU FALLBACK' "$TMP/backend-gpu"; then
+  fail 'a CUDA-attested encoder was reported as a CPU fallback'
+fi
+
+# A missing backend line is unattested, not proof of GPU.
+: >"$EVENTS"
+"$ROOT/docker-compose-manager.sh" encoders up >"$TMP/backend-unknown" 2>&1
+grep -q 'backend is unattested' "$TMP/backend-unknown"
+if grep -q 'ready on GPU' "$TMP/backend-unknown"; then
+  fail 'dcm claimed a GPU backend it never saw in the logs'
+fi
+
+# DCM_REQUIRE_GPU=0 is the only way to accept the slow path, and it says so.
+: >"$EVENTS"
+set +e
+FAKE_ENCODER_BACKEND=cpu DCM_REQUIRE_GPU=0 DCM_GPU_START_ATTEMPTS=1 \
+  "$ROOT/docker-compose-manager.sh" encoders up >"$TMP/gpu-optout" 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] || fail "DCM_REQUIRE_GPU=0 must keep a deliberately slow encoder up, got $rc"
+grep -q 'DCM_REQUIRE_GPU=0' "$TMP/gpu-optout"
+grep -q 'Encoders are ready on CPU' "$TMP/gpu-optout"
+
+# ------------------------------- model up is one command for both GPU models
+# It must fail loudly if the encoders it also started land on CPU, and it must
+# have tried the LLM and the encoders in that same single invocation.
+: >"$EVENTS"
+set +e
+FAKE_ENCODER_BACKEND=cpu DCM_GPU_START_ATTEMPTS=1 \
+  "$ROOT/docker-compose-manager.sh" model up qwen38-27b --vision >"$TMP/model-up-cpu" 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 70 ]] || fail "model up must fail when it cannot serve both models on GPU, got $rc"
+grep -q 'GPU is required' "$TMP/model-up-cpu"
+grep -Fq '<'"$LLM_FILE"'> <up> <-d>' "$EVENTS"
+grep -Fq '<-p> <dcm-model-plane> <-f> <'"$ENC_FILE"'> <up> <-d> <--no-deps> <embedding> <reranker>' "$EVENTS"
+if grep -q 'Model stack is ready' "$TMP/model-up-cpu"; then
+  fail 'model up reported a ready stack while an encoder was CPU-served'
 fi
 
 # ------------------------------------------- legacy single-service commands

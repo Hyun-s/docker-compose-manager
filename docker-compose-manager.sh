@@ -102,8 +102,8 @@ EOF
 show_model_help() {
     cat << EOF
 Manage the local LLM and both always-on TEI encoders (BGE-M3 embedding +
-BGE-reranker-v2-m3) as one stack. Use `dcm encoders` instead whenever you do NOT
-intend to restart the LLM: this command's `down` stops the LLM too, and that is
+BGE-reranker-v2-m3) as one stack. Use 'dcm encoders' instead whenever you do NOT
+intend to restart the LLM: this command's 'down' stops the LLM too, and that is
 the container serving the interactive agent session.
 
 Usage:
@@ -119,6 +119,15 @@ the TEI embedding server starts. This preserves every existing LLM
 concurrency limits and listens only on 127.0.0.1:${DCM_EMBEDDING_PORT:-8081}.
 Containers attached to the named dcm-model-plane network can instead use
 http://dcm-embedding:80/v1 without exposing TEI to the LAN.
+
+'dcm model up' owns BOTH models: it starts the LLM and the two BGE encoders and
+requires every encoder to land on CUDA. A CPU fallback fails the command with
+exit 70, because a CPU-served BGE is the slow-answer bug this plane exists to
+fix. Use DCM_REQUIRE_GPU=0 only to accept that slow path on purpose.
+
+GPU backend:
+  DCM_REQUIRE_GPU                      1 (default) requires CUDA; 0 allows CPU
+  DCM_GPU_START_ATTEMPTS               Recreate attempts before giving up (2)
 
 Embedding overrides:
   DCM_EMBEDDING_IMAGE                    Pinned GB10/arm64 TEI image
@@ -345,6 +354,7 @@ wait_for_reranker_model() {
 # always-on premise is defeated, so surface the actual backend and the host
 # memory headroom instead of pretending the model is on the GPU.
 ENCODER_CPU_FALLBACK=()
+ENCODER_BACKEND_UNKNOWN=()
 
 container_service() {
     case "$1" in
@@ -356,6 +366,7 @@ container_service() {
 
 report_encoder_backends() {
     ENCODER_CPU_FALLBACK=()
+    ENCODER_BACKEND_UNKNOWN=()
     local container backend failed=0
     for container in "${ENCODER_CONTAINERS[@]}"; do
         docker inspect "$container" >/dev/null 2>&1 || { echo "  $container: absent"; continue; }
@@ -366,7 +377,8 @@ report_encoder_backends() {
             *Cuda*) echo "  $container: GPU (${backend})" ;;
             *Cpu*|*CPU*) echo "  $container: CPU FALLBACK (${backend}) - model is NOT on the GPU" >&2
                        ENCODER_CPU_FALLBACK+=("$container"); failed=1 ;;
-            *) echo "  $container: backend unknown (still loading?)" ;;
+            *) echo "  $container: backend unknown (still loading?)"
+               ENCODER_BACKEND_UNKNOWN+=("$container") ;;
         esac
     done
     local avail_gib
@@ -455,8 +467,18 @@ start_encoders() {
         encoders_compose stop reranker >/dev/null 2>&1 || true
         return 70
     fi
-    converge_encoder_backends
-    echo "Encoders are ready: $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    # The return value used to be dropped here, which printed "Encoders are
+    # ready" and exited 0 even when the GPU gate failed. Propagate it.
+    converge_encoder_backends || return "$?"
+    if [[ "${#ENCODER_CPU_FALLBACK[@]}" -gt 0 ]]; then
+        echo "Encoders are ready on CPU (DCM_REQUIRE_GPU=0 override): $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    elif [[ "${#ENCODER_BACKEND_UNKNOWN[@]}" -gt 0 ]]; then
+        echo "Encoders are ready: $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+        echo "Note: no CUDA/CPU line in the logs of ${ENCODER_BACKEND_UNKNOWN[*]} yet, so the" >&2
+        echo "      backend is unattested; confirm with 'dcm encoders status'." >&2
+    else
+        echo "Encoders are ready on GPU: $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    fi
 }
 
 # TEI falls back to CPU when candle cannot create a CUDA context, which on GB10
@@ -464,9 +486,15 @@ start_encoders() {
 # one: the very same container config has been observed to land on Cuda on the
 # next attempt. A CPU-served encoder silently defeats the always-on premise and
 # also caps max_batch_requests at 4, so retry the offenders a bounded number of
-# times before reporting. Set DCM_REQUIRE_GPU=1 to make an unresolved fallback
-# fail the start instead of leaving a slow-but-correct service running.
+# times.
+#
+# GPU is REQUIRED by default. The always-on encoder plane exists precisely
+# because a CPU-served BGE made one RAG answer take a minute, so a silently
+# CPU-served encoder is not "slow but correct" - it is the original failure mode
+# wearing a healthy-looking container. Opt out explicitly with DCM_REQUIRE_GPU=0
+# only when a slow encoder is genuinely preferable to no encoder.
 converge_encoder_backends() {
+    local require_gpu="${DCM_REQUIRE_GPU:-1}"
     local attempt=0
     local max_attempts="${DCM_GPU_START_ATTEMPTS:-2}"
     local -a offenders=()
@@ -497,13 +525,20 @@ converge_encoder_backends() {
         done
     done
     report_encoder_backends || true
-    if [[ "${DCM_REQUIRE_GPU:-0}" == 1 && "${#ENCODER_CPU_FALLBACK[@]}" -gt 0 ]]; then
-        echo "Error: DCM_REQUIRE_GPU=1 and these encoders are CPU-served: ${ENCODER_CPU_FALLBACK[*]}" >&2
-        echo "       Free host memory or lower the batch token budgets, then retry." >&2
+    if [[ "${#ENCODER_CPU_FALLBACK[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "$require_gpu" != 0 ]]; then
+        echo "Error: GPU is required (DCM_REQUIRE_GPU defaults to 1) and these encoders are" >&2
+        echo "       CPU-served after ${max_attempts} recreate attempts: ${ENCODER_CPU_FALLBACK[*]}" >&2
+        echo "       They stay running on CPU: slow for the embedder, and Maple Chat's reranker" >&2
+        echo "       client is fail-open, so answers would go out un-reranked without warning." >&2
+        echo "       Free host memory or lower DCM_*_MAX_BATCH_TOKENS and retry, or accept the" >&2
+        echo "       slow path deliberately with DCM_REQUIRE_GPU=0." >&2
         return 70
     fi
-    echo "Warning: the encoders above are CPU-served; rerun 'dcm encoders restart' when" >&2
-    echo "         host memory has more headroom." >&2
+    echo "Warning: DCM_REQUIRE_GPU=0, so the encoders above stay CPU-served; rerun" >&2
+    echo "         'dcm encoders restart' when host memory has more headroom." >&2
     return 0
 }
 
@@ -523,6 +558,13 @@ cmd_model_up() {
         return 1
     }
 
+    # One command, one stack: this starts the LLM and both BGE encoders, and it
+    # requires all three on the GPU. There is no separate encoder step to
+    # remember; 'dcm encoders ...' exists only for touching the encoders
+    # WITHOUT restarting the LLM.
+    echo "Starting the full model stack: LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS" >&2
+    echo "(both encoders must land on CUDA; pass DCM_REQUIRE_GPU=0 to allow a CPU fallback)." >&2
+
     # vLLM computes its requested memory budget at startup. Starting it before
     # the smaller TEI encoders avoids the encoder processes reducing the free
     # memory visible to the primary model, so every existing
@@ -531,7 +573,13 @@ cmd_model_up() {
     wait_for_openai_model "LLM" "$(llm_api_port "$config_name")" "local-coder" "$MODEL_READY_TIMEOUT"
 
     start_encoders || return 70
-    echo "Model stack is ready: LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    if [[ "${#ENCODER_CPU_FALLBACK[@]}" -gt 0 ]]; then
+        echo "Model stack is ready on CPU encoders (DCM_REQUIRE_GPU=0): LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    elif [[ "${#ENCODER_BACKEND_UNKNOWN[@]}" -gt 0 ]]; then
+        echo "Model stack is ready: LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    else
+        echo "Model stack is ready on the GPU: LLM + $EMBEDDING_MODEL_ALIAS + $RERANKER_MODEL_ALIAS."
+    fi
 }
 
 cmd_model_down() {
@@ -639,8 +687,11 @@ Reranker sizing (measured on this box; two knobs are traps):
 Overrides:
   DCM_RERANKER_IMAGE / DCM_RERANKER_PORT / DCM_RERANKER_MODEL / _MODEL_REVISION
   DCM_RERANKER_MAX_BATCH_TOKENS (default 8192) / _MAX_BATCH_REQUESTS (8)
-  DCM_RERANKER_MAX_CLIENT_BATCH_SIZE (64) / _MAX_CONCURRENT_REQUESTS (16)
+  DCM_RERANKER_MAX_CLIENT_BATCH_SIZE (64) / _MAX_CONCURRENT_REQUESTS (64)
+  (permits must stay >= client batch size or every large /rerank is a 429)
   DCM_EMBEDDING_* as before, DCM_ENCODERS_PROJECT to rename the project.
+  DCM_REQUIRE_GPU (default 1) fails start/restart on a CPU fallback; 0 accepts
+  it deliberately. DCM_GPU_START_ATTEMPTS (default 2) bounds the retries.
 
 Examples:
   dcm encoders status
